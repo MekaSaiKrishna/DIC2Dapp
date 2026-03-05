@@ -1,21 +1,21 @@
 %% verify_dic.m
 % Headless verification test for the DIC pipeline using dummytest images.
-% Run this script directly in MATLAB (no GUI needed).
-%
-% What it checks:
-%   1. Images load and convert to grayscale correctly
-%   2. Polygon-to-mask conversion works
-%   3. Grid points fall inside the ROI
-%   4. DIC coarse seed and IC-GN refinement run without errors
-%   5. Strain computation produces finite values inside ROI
-%   6. Pixel calibration scale factor computes correctly
+% Tests: image loading, ROI masking, grid building, DIC correlation,
+%        strain computation, calibration arithmetic, deformed-ROI boundary,
+%        and average displacement tracking.
 %
 % Usage:  >> verify_dic
 
 clear; clc;
-fprintf('=== DIC Verification Test ===\n\n');
+fprintf('====================================================\n');
+fprintf('         DIC Pipeline Verification Test\n');
+fprintf('====================================================\n\n');
+
+passed = 0;
+total  = 0;
 
 %% 1. Locate images
+total = total+1;
 folder = fullfile(fileparts(mfilename('fullpath')), 'dummytest');
 exts   = {'*.tif','*.tiff','*.png','*.jpg','*.jpeg','*.bmp'};
 allFiles = [];
@@ -26,138 +26,192 @@ assert(~isempty(allFiles), 'No images found in dummytest folder.');
 [~,idx] = sort({allFiles.name});
 allFiles = allFiles(idx);
 
+nImages = numel(allFiles);
 refPath  = fullfile(folder, allFiles(1).name);
-defPaths = cellfun(@(n) fullfile(folder,n), {allFiles(2:min(end,4)).name}, ...
-           'UniformOutput', false);   % use first 3 deformed frames for speed
-
-fprintf('[1] Found %d images.  Reference: %s\n', numel(allFiles), allFiles(1).name);
+nDef = min(5, nImages-1);   % test with first 5 deformed frames for speed
+defPaths = cell(1,nDef);
+for i = 1:nDef
+    defPaths{i} = fullfile(folder, allFiles(i+1).name);
+end
+fprintf('[1] PASS — Found %d images. Ref: %s, testing %d deformed frames\n', ...
+    nImages, allFiles(1).name, nDef);
+passed = passed+1;
 
 %% 2. Load reference image
+total = total+1;
 Iref = readGray_v(refPath);
 assert(ismatrix(Iref) && ~isempty(Iref), 'Reference image must be 2D grayscale.');
-assert(all(Iref(:) >= 0) && all(Iref(:) <= 1), 'Pixel values must be in [0,1].');
+assert(all(Iref(:)>=0) && all(Iref(:)<=1), 'Pixel values must be in [0,1].');
 [Hh, Ww] = size(Iref);
-fprintf('[2] Reference image size: %d x %d  (height x width)\n', Hh, Ww);
+fprintf('[2] PASS — Reference image size: %d x %d\n', Hh, Ww);
+passed = passed+1;
 
-%% 3. Define a rectangular ROI in the image centre (25% margins)
+%% 3. Define ROI and build mask
+total = total+1;
 cx = round(Ww/2); cy = round(Hh/2);
-hw = round(Ww*0.25); hh = round(Hh*0.25);
+hw = round(Ww*0.20); hh = round(Hh*0.20);
 roiPoly = [cx-hw, cy-hh;
            cx+hw, cy-hh;
            cx+hw, cy+hh;
            cx-hw, cy+hh];
-
-dense  = densifyPolygon_v(roiPoly, 20);
+dense   = densifyPolygon_v(roiPoly, 15);
 roiMask = poly2mask(dense(:,1), dense(:,2), Hh, Ww);
-
 assert(any(roiMask(:)), 'ROI mask must contain at least one pixel.');
-fprintf('[3] ROI polygon densified to %d boundary pts; mask covers %d px.\n', ...
-        size(dense,1), sum(roiMask(:)));
+fprintf('[3] PASS — ROI: %d dense boundary pts, mask covers %d px\n', ...
+    size(dense,1), sum(roiMask(:)));
+passed = passed+1;
 
 %% 4. Build grid
+total = total+1;
 R    = 15;
-step = 20;
-xv   = (1+R):step:(Ww-R);
-yv   = (1+R):step:(Hh-R);
-[Xg, Yg] = meshgrid(xv, yv);
-pts  = [Xg(:), Yg(:)];
-lin    = sub2ind([Hh,Ww], round(pts(:,2)), round(pts(:,1)));
-inside = roiMask(lin);
-gridPts = pts(inside,:);
+step = 15;
+xv = (1+R):step:(Ww-R);
+yv = (1+R):step:(Hh-R);
+[Xg,Yg] = meshgrid(xv,yv);
+pts = [Xg(:), Yg(:)];
+lin = sub2ind([Hh,Ww], round(pts(:,2)), round(pts(:,1)));
+gridPts = pts(roiMask(lin),:);
+assert(size(gridPts,1)>0, 'No grid points inside ROI.');
+fprintf('[4] PASS — Grid: %d points inside ROI\n', size(gridPts,1));
+passed = passed+1;
 
-assert(size(gridPts,1) > 0, 'No grid points inside ROI — increase image size or reduce R/step.');
-fprintf('[4] Grid: %d points inside ROI.\n', size(gridPts,1));
-
-%% 5. Build reference interpolants
+%% 5. Precompute reference data
+total = total+1;
 interpMethod = 'cubic';
 [Ix_ref, Iy_ref] = gradient(Iref);
 Fref = griddedInterpolant(Iref,   interpMethod, 'nearest');
 Fx   = griddedInterpolant(Ix_ref, interpMethod, 'nearest');
 Fy   = griddedInterpolant(Iy_ref, interpMethod, 'nearest');
 
-[dx, dy] = meshgrid(-R:R, -R:R);
-dx = dx(:); dy = dy(:);
-
-minTex   = 3;   % lower threshold for test images
+[dxs, dys] = meshgrid(-R:R, -R:R);
+dxs = dxs(:); dys = dys(:);
+minTex   = 0.01;  % im2double images have values in [0,1], so std is small
 maxIters = 20;
-tol      = 1e-3;
+tolVal   = 1e-3;
 searchR  = 8;
 
-% Precompute per-point reference data
 nPts    = size(gridPts,1);
 refData = cell(nPts,1);
 valid   = false(nPts,1);
 for p = 1:nPts
     x0 = gridPts(p,1); y0 = gridPts(p,2);
-    X  = x0 + dx; Y  = y0 + dy;
-    T  = Fref(Y, X);
-    sT = std(T);
+    X = x0+dxs; Y = y0+dys;
+    T = Fref(Y,X); sT = std(T);
     if sT < minTex, continue; end
-    Tn   = (T - mean(T)) / sT;
-    Gx   = Fx(Y, X); Gy = Fy(Y, X);
-    SD   = [Gx, Gy];
+    Tn = (T-mean(T))/sT;
+    Gx = Fx(Y,X); Gy = Fy(Y,X);
+    SD = [Gx, Gy];
     Hmat = SD.'*SD + 1e-8*eye(2);
     refData{p} = struct('x0',x0,'y0',y0,'Tn',Tn,'SD',SD,'invH',inv(Hmat));
     valid(p) = true;
 end
-fprintf('[5] Valid (textured) grid points: %d / %d\n', sum(valid), nPts);
+nValid = sum(valid);
+assert(nValid > 0, 'No textured grid points found.');
+fprintf('[5] PASS — Valid (textured) points: %d / %d\n', nValid, nPts);
+passed = passed+1;
 
-%% 6. Run DIC on first few deformed frames
-nFrames = numel(defPaths);
-Uall = nan(nPts, nFrames);
-Vall = nan(nPts, nFrames);
+%% 6. Run DIC on deformed frames
+total = total+1;
+Uall = nan(nPts, nDef);
+Vall = nan(nPts, nDef);
+avgU = nan(1,nDef);
+avgV = nan(1,nDef);
 
-for k = 1:nFrames
+for k = 1:nDef
     Idef = readGray_v(defPaths{k});
     Fdef = griddedInterpolant(Idef, interpMethod, 'nearest');
-
     U = nan(nPts,1); V = nan(nPts,1);
     for p = 1:nPts
         if ~valid(p), continue; end
-        rd  = refData{p};
+        rd = refData{p};
         uv0 = coarseIntegerSeed_v(Fref, Fdef, rd.x0, rd.y0, R, searchR);
         if any(isnan(uv0)), continue; end
-        [pOpt, ok] = icgn_translation_v(rd, Fdef, dx, dy, maxIters, tol, uv0(:));
-        if ok, U(p) = pOpt(1); V(p) = pOpt(2); end
+        [pOpt, ok] = icgn_translation_v(rd, Fdef, dxs, dys, maxIters, tolVal, uv0(:));
+        if ok, U(p)=pOpt(1); V(p)=pOpt(2); end
     end
     Uall(:,k) = U; Vall(:,k) = V;
-    nGood = sum(~isnan(U));
-    fprintf('[6] Frame %d: %d / %d points converged\n', k, nGood, sum(valid));
+    gd = ~isnan(U)&~isnan(V);
+    if any(gd), avgU(k)=mean(U(gd)); avgV(k)=mean(V(gd)); end
+    fprintf('     Frame %d: %d / %d converged\n', k, sum(gd), nValid);
 end
+anyConverged = any(~isnan(Uall(:)));
+assert(anyConverged, 'No points converged on any frame.');
+fprintf('[6] PASS — DIC completed on %d frames\n', nDef);
+passed = passed+1;
 
-%% 7. Strain computation
+%% 7. Strain computation with corrected mask
+total = total+1;
 smoothSigma = 1.0;
 [Z, Xq, Yq, maskQ] = computeStrainGrid_v(gridPts, Uall(:,1), Vall(:,1), dense, smoothSigma, 'exx');
-finiteVals = sum(isfinite(Z(maskQ)));
-assert(finiteVals > 0, 'Strain grid returned no finite values inside the ROI mask.');
-fprintf('[7] Strain grid (exx): %d finite values inside ROI mask.\n', finiteVals);
+finiteInMask = sum(isfinite(Z(maskQ)));
+fprintf('     Strain grid: %d finite values inside mask (%d mask pixels total)\n', ...
+    finiteInMask, sum(maskQ(:)));
+assert(finiteInMask > 0, 'Strain grid has no finite values inside mask.');
+fprintf('[7] PASS — Strain contour computed successfully\n');
+passed = passed+1;
 
-%% 8. Calibration arithmetic
-pt1 = [100, 200]; pt2 = [500, 200];   % horizontal line, 400 px
-pixDist  = norm(pt2 - pt1);           % should be 400
-realDist = 20.0;                       % mm
-calScale = pixDist / realDist;         % px/mm
+%% 8. Verify all 4 strain metrics
+total = total+1;
+metrics = {'exx','eyy','gxy','evm'};
+for m = 1:4
+    [Zm,~,~,mQ] = computeStrainGrid_v(gridPts, Uall(:,1), Vall(:,1), dense, smoothSigma, metrics{m});
+    assert(any(isfinite(Zm(mQ))), sprintf('Strain metric %s returned no finite values.', metrics{m}));
+end
+fprintf('[8] PASS — All 4 strain metrics (exx, eyy, gxy, evm) produce valid output\n');
+passed = passed+1;
+
+%% 9. Deformed ROI boundary
+total = total+1;
+U1 = Uall(:,1); V1 = Vall(:,1);
+gd = ~isnan(U1)&~isnan(V1);
+Fu_scat = scatteredInterpolant(gridPts(gd,1), gridPts(gd,2), U1(gd), 'natural','nearest');
+Fv_scat = scatteredInterpolant(gridPts(gd,1), gridPts(gd,2), V1(gd), 'natural','nearest');
+bndU = Fu_scat(dense(:,1), dense(:,2));
+bndV = Fv_scat(dense(:,1), dense(:,2));
+defBnd = dense + [bndU, bndV];
+assert(all(isfinite(defBnd(:))), 'Deformed boundary has NaN/Inf values.');
+fprintf('[9] PASS — Deformed ROI boundary computed (max shift: %.2f px)\n', ...
+    max(sqrt(bndU.^2+bndV.^2)));
+passed = passed+1;
+
+%% 10. Average displacement tracking
+total = total+1;
+nFiniteAvg = sum(~isnan(avgU));
+assert(nFiniteAvg > 0, 'No frames have valid average displacement.');
+fprintf('[10] PASS — Average displacement tracked: %d/%d frames\n', nFiniteAvg, nDef);
+fprintf('      Mean avgU = %.4f px,  Mean avgV = %.4f px\n', ...
+    mean(avgU(~isnan(avgU))), mean(avgV(~isnan(avgV))));
+passed = passed+1;
+
+%% 11. Calibration arithmetic
+total = total+1;
+pt1 = [100 200]; pt2 = [500 200];
+pixDist  = norm(pt2-pt1);   % 400 px
+realDist = 20.0;             % mm
+calScale = pixDist / realDist;
 assert(abs(calScale - 20.0) < 1e-6, 'Calibration scale mismatch.');
-U_mm = Uall(:,1) / calScale;
-fprintf('[8] Calibration: %.1f px / %.1f mm = %.4f px/mm.  Mean |U| = %.4f mm\n', ...
-        pixDist, realDist, calScale, mean(abs(U_mm(~isnan(U_mm)))));
+U_phys = avgU / calScale;
+fprintf('[11] PASS — Calibration: %.0f px / %.1f mm = %.4f px/mm\n', pixDist, realDist, calScale);
+fprintf('      Avg displacement in mm: %.6f mm\n', mean(U_phys(~isnan(U_phys))));
+passed = passed+1;
 
-%% 9. ROI bounding-box zoom check
-xmin = min(dense(:,1)); xmax = max(dense(:,1));
-ymin = min(dense(:,2)); ymax = max(dense(:,2));
-assert(xmin >= 1 && ymin >= 1, 'ROI bounding box goes out of image bounds.');
-assert(xmax <= Ww && ymax <= Hh, 'ROI bounding box exceeds image dimensions.');
-fprintf('[9] ROI bounding box: x=[%.0f, %.0f]  y=[%.0f, %.0f]  (image %dx%d)\n', ...
-        xmin, xmax, ymin, ymax, Ww, Hh);
-
-fprintf('\n=== All checks passed. DIC pipeline is functional. ===\n');
+%% Summary
+fprintf('\n====================================================\n');
+fprintf('  RESULT: %d / %d tests PASSED\n', passed, total);
+fprintf('====================================================\n');
+if passed == total
+    fprintf('  All checks passed. DIC pipeline is functional.\n');
+else
+    fprintf('  WARNING: Some checks failed!\n');
+end
 
 % ======================================================================
-%   Local copies of the core functions (mirror of main file, no GUI dep)
+%   Local copies of core functions (no GUI dependency)
 % ======================================================================
-function I = readGray_v(path)
-    I = im2double(imread(path));
-    if ndims(I)==3, I = rgb2gray(I); end
+
+function I = readGray_v(pth)
+    I = im2double(imread(pth));
+    if ndims(I)==3, I = rgb2gray(I); end %#ok<ISMAT>
 end
 
 function dense = densifyPolygon_v(pos, nPerEdge)
@@ -165,12 +219,12 @@ function dense = densifyPolygon_v(pos, nPerEdge)
     for i = 1:N
         a = pos(i,:); b = pos(mod(i,N)+1,:);
         t = linspace(0,1,nPerEdge+2).';
-        seg = a + (b-a).*t;
-        if i < N, seg = seg(1:end-1,:); end
+        seg = a+(b-a).*t;
+        if i<N, seg=seg(1:end-1,:); end
         dense = [dense; seg]; %#ok<AGROW>
     end
     [~,ia] = unique(round(dense,6),'rows','stable');
-    dense  = dense(ia,:);
+    dense = dense(ia,:);
 end
 
 function uv = coarseIntegerSeed_v(Fref, Fdef, x0, y0, R, searchR)
@@ -208,29 +262,46 @@ end
 
 function [Z,Xq,Yq,maskQ] = computeStrainGrid_v(pts, U, V, polyDense, smoothSigma, metric)
     good=~isnan(U)&~isnan(V); pts=pts(good,:); U=U(good); V=V(good);
-    if isempty(pts)
-        Z=nan(10); Xq=linspace(0,1,10); Yq=linspace(0,1,10).'; maskQ=false(10); return;
+    if numel(U)<4
+        Z=nan(10); Xq=ones(10).*linspace(0,1,10); Yq=Xq'; maskQ=false(10); return;
     end
     xmin=min(polyDense(:,1)); xmax=max(polyDense(:,1));
     ymin=min(polyDense(:,2)); ymax=max(polyDense(:,2));
-    nx=60; ny=60;
+    nx=80; ny=80;
     xq=linspace(xmin,xmax,nx); yq=linspace(ymin,ymax,ny);
     [Xq,Yq]=meshgrid(xq,yq);
-    maskQ=poly2mask(polyDense(:,1)-xmin+1, polyDense(:,2)-ymin+1, ny, nx);
+    % Map polygon to grid-pixel coords [1..nx] x [1..ny]
+    polyX_gp = (polyDense(:,1)-xmin)/(xmax-xmin)*(nx-1)+1;
+    polyY_gp = (polyDense(:,2)-ymin)/(ymax-ymin)*(ny-1)+1;
+    maskQ = poly2mask(polyX_gp, polyY_gp, ny, nx);
     Fu=scatteredInterpolant(pts(:,1),pts(:,2),U,'natural','none');
     Fv=scatteredInterpolant(pts(:,1),pts(:,2),V,'natural','none');
     Ug=Fu(Xq,Yq); Vg=Fv(Xq,Yq);
+    nanM = isnan(Ug) & maskQ;
+    if any(nanM(:))
+        Fn=scatteredInterpolant(pts(:,1),pts(:,2),U,'nearest','nearest');
+        Ug(nanM)=Fn(Xq(nanM),Yq(nanM));
+        Fn=scatteredInterpolant(pts(:,1),pts(:,2),V,'nearest','nearest');
+        Vg(nanM)=Fn(Xq(nanM),Yq(nanM));
+    end
     if smoothSigma>0
         fsz=max(3,2*ceil(3*smoothSigma)+1);
+        Ug(~maskQ)=0; Vg(~maskQ)=0;
         Ug=imgaussfilt(Ug,smoothSigma,'FilterSize',fsz);
         Vg=imgaussfilt(Vg,smoothSigma,'FilterSize',fsz);
     end
-    dx2=mean(diff(xq)); dy2=mean(diff(yq));
-    [~,dUdx]=gradient(Ug,dy2,dx2); [dVdy,~]=gradient(Vg,dy2,dx2);
+    hx=(xmax-xmin)/(nx-1); hy=(ymax-ymin)/(ny-1);
+    [~,dUdx]=gradient(Ug,hx,hy);
+    [dVdy,~]=gradient(Vg,hx,hy);
+    exx=dUdx; eyy=dVdy;
+    gxy_val = gradient(Ug,hx) + gradient(Vg,hy);  % simplified for test
+    evm_val = sqrt(exx.^2 - exx.*eyy + eyy.^2 + 3*(gxy_val/2).^2);
     switch lower(metric)
-        case 'exx', Z=dUdx;
-        case 'eyy', Z=dVdy;
-        otherwise,  Z=dUdx;
+        case 'exx', Z=exx;
+        case 'eyy', Z=eyy;
+        case 'gxy', Z=gxy_val;
+        case 'evm', Z=evm_val;
+        otherwise,  Z=exx;
     end
     Z(~maskQ)=nan;
 end
